@@ -5,6 +5,9 @@ from PIL import Image
 import emotion_classifier as ec
 import io
 import wave
+import time
+import os
+import sys
 
 # --- Small utilities: tone generator and jokes list ---
 def generate_tone_wav_bytes(duration_s=2.0, freq=440.0, sr=22050):
@@ -37,61 +40,111 @@ import streamlit.components.v1 as components
 
 def play_sleep_audio():
     """Play sleep audio from repo `sleep.mp3` if present, otherwise play generated tone."""
-    if os.path.exists("sleep.mp3"):
-        with open("sleep.mp3", "rb") as f:
-            audio_bytes = f.read()
-        st.audio(audio_bytes, format="audio/mp3")
-    else:
+    try:
+        if os.path.exists("sleep.mp3"):
+            try:
+                with open("sleep.mp3", "rb") as f:
+                    audio_bytes = f.read()
+                if audio_bytes and len(audio_bytes) > 100:  # Sanity check: valid MP3 file
+                    st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+                    return
+                else:
+                    raise ValueError("sleep.mp3 appears corrupted or too small")
+            except Exception as mp3_err:
+                st.warning(f"⚠️ Could not load sleep.mp3: {str(mp3_err)[:50]}. Using fallback tone.")
+        
+        # Fallback: generate tone
         tone = generate_tone_wav_bytes(duration_s=3.0, freq=330.0)
-        st.audio(tone, format="audio/wav")
+        st.audio(tone, format="audio/wav", autoplay=True)
+    except Exception as e:
+        st.warning(f"⚠️ Audio playback unavailable")
 
 
 def speak_joke_html(joke_text: str):
     """Use browser Web Speech API to speak a joke via injected HTML/JS."""
-    escaped = joke_text.replace("\n", "\\n").replace("\"", "\\\"")
-    html = f"""
-    <script>
-    const msg = new SpeechSynthesisUtterance("{escaped}");
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(msg);
-    </script>
-    """
-    components.html(html, height=0)
+    try:
+        # Escape special chars safely for JS string
+        escaped = joke_text.replace("\n", " ").replace("\\", " ").replace('"', "'").strip()
+        if not escaped or len(escaped) < 3:
+            return  # Skip if too short
+        
+        html = f"""
+        <script>
+        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {{
+            try {{
+                const msg = new SpeechSynthesisUtterance("{escaped}");
+                msg.rate = 1.0;
+                msg.pitch = 1.0;
+                msg.volume = 0.8;
+                window.speechSynthesis.cancel();
+                window.speechSynthesis.speak(msg);
+            }} catch(err) {{
+                console.warn("TTS failed: " + err.message);
+            }}
+        }}
+        </script>
+        """
+        components.html(html, height=0)
+    except Exception as e:
+        pass  # Silent fail for TTS — not critical
 
 
 def process_np_image(np_img, image_size):
     """Run mediapipe on an RGB numpy array and return (emotion_label, display_img, debug_info)."""
-    # Resize for performance
-    display_img = cv2.resize(np_img, (image_size, int(np_img.shape[0] * image_size / np_img.shape[1])))
-    # Run detection
-    res = ec.facemesh.process(display_img)
-    debug_info = {}
-    emotion_label = "No face"
-    if res.multi_face_landmarks:
-        face_lms = res.multi_face_landmarks[0]
-        landmarks = face_lms.landmark
-        # Draw face mesh
-        ec.mpdrawing.draw_landmarks(
-            image=display_img,
-            landmark_list=face_lms,
-            connections=ec.mpface.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=ec.mpstyles.get_default_face_mesh_tesselation_style()
-        )
-        mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt = ec.get_features(landmarks)
-        emotion = ec.classify_emotion(mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt)
-        cry_state = ec.classify_crying(eye_open, inner_eye_dist, 0)
-        emotion_label = cry_state if cry_state else emotion
-        debug_info = {
-            "mouth_open": f"{mouth_open:.3f}",
-            "mouth_width": f"{mouth_width:.3f}",
-            "eye_open": f"{eye_open:.3f}",
-            "nose_cod": f"{nose_cod:.3f}",
-            "inner_eye_dist": f"{inner_eye_dist:.3f}",
-            "lip_asym": f"{lip_asym:.3f}",
-            "head_tilt": f"{head_tilt:.3f}",
-        }
-    return emotion_label, display_img, debug_info
+    try:
+        # Validate input
+        if np_img is None or np_img.size == 0:
+            return "No face", np_img, {}
+        
+        if len(np_img.shape) < 2:
+            return "No face", np_img, {}
+        
+        # Resize for performance
+        h, w = np_img.shape[:2]
+        if w <= 0 or h <= 0:
+            return "No face", np_img, {}
+        
+        aspect = h / max(w, 1)
+        new_h = max(1, int(image_size * aspect))
+        display_img = cv2.resize(np_img, (image_size, new_h))
+        
+        # Run detection
+        res = ec.facemesh.process(display_img)
+        debug_info = {}
+        emotion_label = "No face"
+        
+        if res.multi_face_landmarks and len(res.multi_face_landmarks) > 0:
+            face_lms = res.multi_face_landmarks[0]
+            landmarks = face_lms.landmark
+            
+            # Draw face mesh
+            ec.mpdrawing.draw_landmarks(
+                image=display_img,
+                landmark_list=face_lms,
+                connections=ec.mpface.FACEMESH_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=ec.mpstyles.get_default_face_mesh_tesselation_style()
+            )
+            
+            mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt = ec.get_features(landmarks)
+            emotion = ec.classify_emotion(mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt)
+            cry_state = ec.classify_crying(eye_open, inner_eye_dist, 0)
+            emotion_label = cry_state if cry_state else emotion
+            
+            debug_info = {
+                "mouth_open": f"{mouth_open:.3f}",
+                "mouth_width": f"{mouth_width:.3f}",
+                "eye_open": f"{eye_open:.3f}",
+                "nose_cod": f"{nose_cod:.3f}",
+                "inner_eye_dist": f"{inner_eye_dist:.3f}",
+                "lip_asym": f"{lip_asym:.3f}",
+                "head_tilt": f"{head_tilt:.3f}",
+            }
+        
+        return emotion_label, display_img, debug_info
+    except Exception as e:
+        st.error(f"Image processing error: {str(e)[:80]}")
+        return "No face", np_img, {}
 
 
 def main():
@@ -160,7 +213,6 @@ def main():
                                     st.write(f"- {k}: {v}")
 
                         # Actions based on emotion
-                        import time
                         if emotion_label.lower() in ["sleepy", "drowsy", "yawning"]:
                             now = time.time()
                             if now - st.session_state.last_sleep_play > 5.0:
@@ -184,10 +236,10 @@ def main():
         else:
             # Live mode via streamlit-webrtc
             try:
-                from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+                from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
                 import av
-            except Exception as e:
-                st.warning("streamlit-webrtc is not installed in the environment. Install with `pip install streamlit-webrtc av` and redeploy.")
+            except ImportError as e:
+                st.error("❌ streamlit-webrtc or av not installed. Please redeploy or run: `pip install streamlit-webrtc av`")
                 st.stop()
 
             class EmotionProcessor(VideoProcessorBase):
@@ -196,18 +248,27 @@ def main():
                     self.latest_emotion = "No face"
 
                 def recv(self, frame):
-                    img = frame.to_ndarray(format="bgr24")
-                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    emotion_label, display_img, _ = process_np_image(rgb, image_size)
-                    # process_np_image returns RGB display_img; convert to BGR for output
-                    out = cv2.cvtColor(display_img, cv2.COLOR_RGB2BGR)
-                    # overlay label
-                    color = ec.COLOR_MAP.get(emotion_label, (0, 255, 0))
-                    cv2.rectangle(out, (0, 0), (out.shape[1], 55), (0, 0, 0), -1)
-                    cv2.putText(out, emotion_label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-                    self.latest_emotion = emotion_label
-                    self.frame = out
-                    return av.VideoFrame.from_ndarray(out, format="bgr24")
+                    try:
+                        img = frame.to_ndarray(format="bgr24")
+                        if img is None or img.size == 0:
+                            return frame
+                        
+                        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        emotion_label, display_img, _ = process_np_image(rgb, image_size)
+                        
+                        # process_np_image returns RGB display_img; convert to BGR for output
+                        out = cv2.cvtColor(display_img, cv2.COLOR_RGB2BGR)
+                        
+                        # overlay label
+                        color = ec.COLOR_MAP.get(emotion_label, (0, 255, 0))
+                        cv2.rectangle(out, (0, 0), (out.shape[1], 55), (0, 0, 0), -1)
+                        cv2.putText(out, emotion_label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                        self.latest_emotion = emotion_label
+                        self.frame = out
+                        return av.VideoFrame.from_ndarray(out, format="bgr24")
+                    except Exception as e:
+                        # Silently return original frame on error
+                        return frame
 
             ctx = webrtc_streamer(key="live", video_processor_factory=EmotionProcessor, media_stream_constraints={"video": True, "audio": False}, async_processing=True)
 
@@ -215,7 +276,7 @@ def main():
             col_a, col_b = st.columns([1, 1])
             with col_a:
                 if st.button("📸 Capture snapshot from live"):
-                    if ctx and ctx.video_processor and ctx.video_processor.frame is not None:
+                    if ctx and ctx.video_processor and hasattr(ctx.video_processor, 'frame') and ctx.video_processor.frame is not None:
                         frame_bgr = ctx.video_processor.frame
                         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                         emotion_label, display_img, debug_info = process_np_image(rgb, image_size)
@@ -231,7 +292,6 @@ def main():
                                         st.write(f"- {k}: {v}")
 
                             # Actions
-                            import time
                             if emotion_label.lower() in ["sleepy", "drowsy", "yawning"]:
                                 now = time.time()
                                 if now - st.session_state.last_sleep_play > 5.0:
@@ -265,74 +325,88 @@ def main():
         uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
         
         if uploaded_file is not None:
-            # Read image
-            image = Image.open(uploaded_file)
-            img_array = np.array(image)
-            
-            # Convert PIL RGB to OpenCV BGR if needed
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                rgb_img = img_array
-                bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            else:
-                rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-                bgr_img = img_array
-            
-            # Resize for display
-            display_img = cv2.resize(rgb_img, (320, int(rgb_img.shape[0] * 320 / rgb_img.shape[1])))
-            
-            # Run detection
-            res = ec.facemesh.process(display_img)
-            
-            if res.multi_face_landmarks:
-                face_lms = res.multi_face_landmarks[0]
-                landmarks = face_lms.landmark
+            try:
+                # Read image
+                image = Image.open(uploaded_file)
+                if image.mode == 'RGBA':
+                    image = image.convert('RGB')
+                img_array = np.array(image)
                 
-                # Draw face mesh
-                ec.mpdrawing.draw_landmarks(
-                    image=display_img,
-                    landmark_list=face_lms,
-                    connections=ec.mpface.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=ec.mpstyles.get_default_face_mesh_tesselation_style()
-                )
+                # Validate image
+                if img_array is None or img_array.size == 0:
+                    st.error("❌ Invalid image file")
+                    return
                 
-                # Get features and classify
-                mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt = ec.get_features(landmarks)
-                emotion = ec.classify_emotion(mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt)
-                cry_state = ec.classify_crying(eye_open, inner_eye_dist, 0)
-                emotion_label = cry_state if cry_state else emotion
+                # Convert PIL RGB to OpenCV BGR if needed
+                if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                    rgb_img = img_array
+                    bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                elif len(img_array.shape) == 2:
+                    rgb_img = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+                    bgr_img = img_array
+                else:
+                    st.error(f"❌ Unsupported image shape: {img_array.shape}")
+                    return
                 
-                # Draw label
-                color = ec.COLOR_MAP.get(emotion_label, (0, 255, 0))
-                cv2.rectangle(display_img, (0, 0), (display_img.shape[1], 55), (0, 0, 0), -1)
-                cv2.putText(
-                    display_img,
-                    emotion_label,
-                    (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    color,
-                    2,
-                )
+                # Resize for display
+                display_img = cv2.resize(rgb_img, (320, int(rgb_img.shape[0] * 320 / max(rgb_img.shape[1], 1))))
                 
-                # Display result
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.image(display_img, caption="Detected Emotion", channels="BGR")
+                # Run detection
+                res = ec.facemesh.process(display_img)
                 
-                with col2:
-                    st.subheader(f"Emotion: {emotion_label}")
-                    st.write("**Debug Info:**")
-                    st.write(f"- Eye Open: {eye_open:.3f}")
-                    st.write(f"- Mouth Open: {mouth_open:.3f}")
-                    st.write(f"- Mouth Width: {mouth_width:.3f}")
-                    st.write(f"- Nose Cod: {nose_cod:.3f}")
-                    st.write(f"- Inner Eye Dist: {inner_eye_dist:.3f}")
-                    st.write(f"- Lip Asymmetry: {lip_asym:.3f}")
-                    st.write(f"- Head Tilt: {head_tilt:.3f}")
-            else:
-                st.warning("⚠️ No face detected in the image. Please try another image.")
-                st.image(rgb_img, caption="Uploaded Image", use_container_width=True)
+                if res.multi_face_landmarks:
+                    face_lms = res.multi_face_landmarks[0]
+                    landmarks = face_lms.landmark
+                    
+                    # Draw face mesh
+                    ec.mpdrawing.draw_landmarks(
+                        image=display_img,
+                        landmark_list=face_lms,
+                        connections=ec.mpface.FACEMESH_TESSELATION,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=ec.mpstyles.get_default_face_mesh_tesselation_style()
+                    )
+                    
+                    # Get features and classify
+                    mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt = ec.get_features(landmarks)
+                    emotion = ec.classify_emotion(mouth_open, mouth_width, eye_open, nose_cod, inner_eye_dist, lip_asym, head_tilt)
+                    cry_state = ec.classify_crying(eye_open, inner_eye_dist, 0)
+                    emotion_label = cry_state if cry_state else emotion
+                    
+                    # Draw label
+                    color = ec.COLOR_MAP.get(emotion_label, (0, 255, 0))
+                    cv2.rectangle(display_img, (0, 0), (display_img.shape[1], 55), (0, 0, 0), -1)
+                    cv2.putText(
+                        display_img,
+                        emotion_label,
+                        (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,
+                        color,
+                        2,
+                    )
+                    
+                    # Display result
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(display_img, caption="Detected Emotion", channels="BGR")
+                    
+                    with col2:
+                        st.subheader(f"Emotion: {emotion_label}")
+                        st.write("**Debug Info:**")
+                        st.write(f"- Eye Open: {eye_open:.3f}")
+                        st.write(f"- Mouth Open: {mouth_open:.3f}")
+                        st.write(f"- Mouth Width: {mouth_width:.3f}")
+                        st.write(f"- Nose Cod: {nose_cod:.3f}")
+                        st.write(f"- Inner Eye Dist: {inner_eye_dist:.3f}")
+                        st.write(f"- Lip Asymmetry: {lip_asym:.3f}")
+                        st.write(f"- Head Tilt: {head_tilt:.3f}")
+                else:
+                    st.warning("⚠️ No face detected in the image. Please try another image.")
+                    st.image(rgb_img, caption="Uploaded Image", use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"❌ Error processing image: {str(e)[:100]}")
 
 
 if __name__ == "__main__":

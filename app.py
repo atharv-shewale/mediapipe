@@ -5,6 +5,7 @@ from PIL import Image
 import emotion_classifier as ec
 import io
 import wave
+import base64
 import time
 import os
 import sys
@@ -40,34 +41,55 @@ import streamlit.components.v1 as components
 
 def play_sleep_audio():
     """Play sleep audio from repo `sleep.mp3` if present, otherwise play generated tone."""
+    # Note: many mobile browsers block autoplay. Prefer using `Enable Audio` first
+    # which will preload an Audio element in the browser via an explicit user gesture.
     try:
+        # If audio not enabled in session, render a play button to request gesture
+        if not st.session_state.get("audio_enabled", False):
+            if st.button("▶️ Enable audio to allow sleep sound (tap once)"):
+                st.session_state["audio_enabled"] = True
+                # After enabling, we inject a small JS helper to create a global audio element
+                _inject_preloaded_audio()
+            return
+
+        # If enabled, try to play preloaded audio element in browser via JS
+        # Prefer the repo MP3 if available, otherwise fallback to generated WAV.
+        audio_bytes = None
+        audio_fmt = "audio/mp3"
         if os.path.exists("sleep.mp3"):
             try:
                 with open("sleep.mp3", "rb") as f:
                     audio_bytes = f.read()
-                if audio_bytes and len(audio_bytes) > 100:  # Sanity check: valid MP3 file
-                    st.audio(audio_bytes, format="audio/mp3", autoplay=True)
-                    return
-                else:
-                    raise ValueError("sleep.mp3 appears corrupted or too small")
-            except Exception as mp3_err:
-                st.warning(f"⚠️ Could not load sleep.mp3: {str(mp3_err)[:50]}. Using fallback tone.")
-        
-        # Fallback: generate tone
-        tone = generate_tone_wav_bytes(duration_s=3.0, freq=330.0)
-        st.audio(tone, format="audio/wav", autoplay=True)
-    except Exception as e:
+                    audio_fmt = "audio/mp3"
+            except Exception:
+                audio_bytes = None
+
+        if not audio_bytes:
+            audio_bytes = generate_tone_wav_bytes(duration_s=3.0, freq=330.0)
+            audio_fmt = "audio/wav"
+
+        _play_bytes_via_js(audio_bytes, audio_fmt)
+    except Exception:
         st.warning(f"⚠️ Audio playback unavailable")
 
 
 def speak_joke_html(joke_text: str):
     """Use browser Web Speech API to speak a joke via injected HTML/JS."""
     try:
+        if not st.session_state.get("audio_enabled", False):
+            # Show a button so user can explicitly trigger the joke TTS
+            if st.button("🔊 Play joke aloud (requires tapping to enable audio)"):
+                st.session_state["audio_enabled"] = True
+                _inject_preloaded_audio()
+                # proceed to speak after enabling
+            else:
+                return
+
         # Escape special chars safely for JS string
         escaped = joke_text.replace("\n", " ").replace("\\", " ").replace('"', "'").strip()
         if not escaped or len(escaped) < 3:
             return  # Skip if too short
-        
+
         html = f"""
         <script>
         if (typeof window !== 'undefined' && 'speechSynthesis' in window) {{
@@ -75,7 +97,7 @@ def speak_joke_html(joke_text: str):
                 const msg = new SpeechSynthesisUtterance("{escaped}");
                 msg.rate = 1.0;
                 msg.pitch = 1.0;
-                msg.volume = 0.8;
+                msg.volume = 0.9;
                 window.speechSynthesis.cancel();
                 window.speechSynthesis.speak(msg);
             }} catch(err) {{
@@ -85,8 +107,84 @@ def speak_joke_html(joke_text: str):
         </script>
         """
         components.html(html, height=0)
-    except Exception as e:
+    except Exception:
         pass  # Silent fail for TTS — not critical
+
+
+def _play_bytes_via_js(audio_bytes: bytes, audio_fmt: str = "audio/mp3"):
+    """Inject JS that plays provided audio bytes (base64) using a preloaded Audio element.
+    This relies on the user having already pressed an explicit 'Enable audio' button in the UI.
+    """
+    try:
+        b64 = base64.b64encode(audio_bytes).decode("ascii")
+        # Create a small JS snippet that looks for `window._sleepAudio` and uses it,
+        # otherwise creates a new audio element and plays it.
+        html = f"""
+        <script>
+        (function() {{
+            try {{
+                const src = 'data:{audio_fmt};base64,{b64}';
+                let a = window._sleepAudio;
+                if (!a) {{
+                    a = new Audio();
+                    a.src = src;
+                    a.preload = 'auto';
+                    window._sleepAudio = a;
+                }} else {{
+                    // Replace src to ensure latest data
+                    a.src = src;
+                }}
+                a.play().catch(err => console.warn('play failed', err));
+            }} catch(err) {{ console.warn('audio play error', err); }}
+        }})();
+        </script>
+        """
+        components.html(html, height=0)
+    except Exception:
+        # Fallback to server-side st.audio (may be blocked on mobile)
+        try:
+            st.audio(audio_bytes, format=audio_fmt)
+        except Exception:
+            pass
+
+
+def _inject_preloaded_audio():
+    """Create a small global audio element in the browser (requires user gesture).
+    We try to preload `sleep.mp3` if present; otherwise preload a short tone.
+    """
+    try:
+        audio_bytes = None
+        audio_fmt = "audio/mp3"
+        if os.path.exists("sleep.mp3"):
+            try:
+                with open("sleep.mp3", "rb") as f:
+                    audio_bytes = f.read()
+                    audio_fmt = "audio/mp3"
+            except Exception:
+                audio_bytes = None
+
+        if not audio_bytes:
+            audio_bytes = generate_tone_wav_bytes(duration_s=1.5, freq=440.0)
+            audio_fmt = "audio/wav"
+
+        b64 = base64.b64encode(audio_bytes).decode("ascii")
+        html = f"""
+        <script>
+        (function(){{
+            try {{
+                const src = 'data:{audio_fmt};base64,{b64}';
+                let a = new Audio();
+                a.src = src;
+                a.preload = 'auto';
+                window._sleepAudio = a;
+                window._audioEnabled = true;
+            }} catch(err) {{ console.warn('preload audio failed', err); }}
+        }})();
+        </script>
+        """
+        components.html(html, height=0)
+    except Exception:
+        pass
 
 
 def process_np_image(np_img, image_size):
@@ -177,6 +275,18 @@ def main():
             st.session_state.last_emotion = None
         if "last_sleep_play" not in st.session_state:
             st.session_state.last_sleep_play = 0.0
+
+        # Global audio enable button for mobile: user should tap this once to allow autoplay/TTS
+        audio_col1, audio_col2 = st.columns([1, 3])
+        with audio_col1:
+            if not st.session_state.get("audio_enabled", False):
+                if st.button("▶️ Enable audio for sleep sound & jokes"):
+                    st.session_state["audio_enabled"] = True
+                    _inject_preloaded_audio()
+            else:
+                st.write("Audio: Enabled ✅")
+        with audio_col2:
+            st.markdown("Small note: On mobile, please tap 'Enable audio' once so the app can play sounds and speak jokes.")
 
         # Start / Stop buttons
         col_start, col_stop = st.columns([1, 1])
@@ -271,6 +381,39 @@ def main():
                         return frame
 
             ctx = webrtc_streamer(key="live", video_processor_factory=EmotionProcessor, media_stream_constraints={"video": True, "audio": False}, async_processing=True)
+
+            # Auto-capture controls
+            auto_col1, auto_col2 = st.columns([1, 1])
+            with auto_col1:
+                auto_capture = st.checkbox("🔁 Auto-capture from live (periodic)", value=False)
+            with auto_col2:
+                auto_interval = st.slider("Interval (s)", 1, 10, 3)
+
+            # If auto-capture is enabled, inject JS that clicks the capture button periodically
+            if auto_capture:
+                js = f"""
+                <script>
+                (function(){{
+                    try {{
+                        // Periodically look for the Streamlit button with the capture label and click it
+                        const label = '📸 Capture snapshot from live';
+                        function clickIfFound() {{
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            for (const b of buttons) {{
+                                if ((b.innerText || b.textContent || '').trim().includes(label)) {{
+                                    try {{ b.click(); }} catch(e) {{ console.warn('click failed', e); }}
+                                    return;
+                                }}
+                            }}
+                        }}
+                        // Initial try and then interval
+                        clickIfFound();
+                        window._autoCaptureInterval = window._autoCaptureInterval || setInterval(clickIfFound, {auto_interval} * 1000);
+                    }} catch(err) {{ console.warn('auto-capture setup failed', err); }}
+                }})();
+                </script>
+                """
+                components.html(js, height=0)
 
             # Controls to capture current live frame and trigger actions
             col_a, col_b = st.columns([1, 1])
